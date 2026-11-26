@@ -31,6 +31,14 @@ class DevelopmentState(BaseModel):
     review_verdict: str = "UNKNOWN"
     warnings: list[str] = Field(default_factory=list)
 
+    @property
+    def can_publish(self):
+        return(
+            self.test_status == "PASSED"
+            and self.review_verdict == "APPROVED"
+            and self.status == "completed"
+        )
+
 
 class DevelopmentFlow(Flow[DevelopmentState]):
     """Runs development, verified testing, and bounded automatic corrections.
@@ -59,17 +67,19 @@ class DevelopmentFlow(Flow[DevelopmentState]):
         return "UNKNOWN"
 
     @staticmethod
-    def extract_review_verdict(result) -> str:
-        """Read the final reviewer's APPROVED / CHANGES REQUIRED decision."""
+    def extract_review_verdict(
+        result,
+        task_index: int = FINAL_REVIEW_TASK_INDEX,
+    ) -> str:
+        """Extract the final review verdict from a specified task."""
 
         outputs = getattr(result, "tasks_output", None) or []
 
-        if len(outputs) <= FINAL_REVIEW_TASK_INDEX:
+        if len(outputs) <= task_index:
             return "UNKNOWN"
 
-        text = outputs[FINAL_REVIEW_TASK_INDEX].raw or ""
+        text = outputs[task_index].raw or ""
 
-        # Checked first: "not APPROVED" and similar must not read as approval.
         if re.search(r"CHANGES\s+REQUIRED", text, re.IGNORECASE):
             return "CHANGES REQUIRED"
 
@@ -279,6 +289,13 @@ class DevelopmentFlow(Flow[DevelopmentState]):
                     self.extract_task_output(correction_result)
                 )
 
+                # Update the final review verdict after the correction.
+                self.state.review_verdict = self.extract_review_verdict(
+                    correction_result,
+                    task_index=1,
+                )
+
+                # Re-run actual pytest verification.
                 verified_output = self.verify_tests()
 
             self.state.final_report = self.build_final_report(

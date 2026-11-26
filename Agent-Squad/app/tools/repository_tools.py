@@ -45,7 +45,10 @@ class RepositoryStructureTool(BaseTool):
 
             # SECURITY VALIDATION
 
-            if not repository_path.is_relative_to(WORKSPACE_ROOT):
+            if(
+                repository_path == WORKSPACE_ROOT
+                or not repository_path.is_relative_to(WORKSPACE_ROOT)
+            ):
                 return "Error: Access outside WORKSPACE is prohibited."
 
             if not repository_path.is_dir():

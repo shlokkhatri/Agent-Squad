@@ -1,7 +1,12 @@
-from fastapi import APIRouter, BackgroundTasks, HTTPException
-from pydantic import BaseModel, Field
+import uuid
+
+from datetime import datetime, timezone
+
+from fastapi import APIRouter,BackgroundTasks,HTTPException
+from pydantic import BaseModel,Field
 
 from app.flows.development_flow import DevelopmentFlow
+
 from app.services.jobs import (
     RepositoryBusyError,
     acquire_repository,
@@ -11,116 +16,283 @@ from app.services.jobs import (
     job_store,
     release_repository,
 )
+
 from app.workspace import repository_exists
 
+from app.integrations.github_service import (
+    GithubIntegrationError,
+    clone_repository,
+    create_development_branch,
+    validate_github_url,
+    repository_directory_name,
+)
 
-router = APIRouter(prefix="/api", tags=["Agent Squad"])
+router = APIRouter(
+    prefix="/api",
+    tags= ["Agent Squad"]
+)
 
-ERROR_STATUS_CODES = {
-    "QUOTA_EXCEEDED": 503,
-    "REPOSITORY_NOT_FOUND": 404,
+ERROR_STATUS_CODE = {
+    "QUOTA_EXCEEDED" : 503,
+    "REPOSITORY_NOT_FOUND" : 404,
 }
 
 
+
 class DevelopmentRequest(BaseModel):
-    repository_name: str = Field(
-        ...,
-        min_length=1,
-        description="Repository folder name inside workspace/repositories.",
+
+    repository_name: str | None = Field(default=None)
+
+    repository_url: str | None = Field(default=None)
+
+    base_branch: str | None = Field(
+        default=None,
+        description=(
+            "Optional GitHub base branch. "
+            "If omitted, Agent Squad detects the default branch."
+        ),
     )
+
     user_request: str = Field(
         ...,
         min_length=5,
-        description="Feature request or software change to implement.",
     )
 
+def _resolve_repository(request):
 
-def _validated_repository(request: DevelopmentRequest) -> str:
-    name = request.repository_name.strip()
-
-    if not repository_exists(name):
+    if bool(request.repository_name) == bool(
+        request.repository_url
+    ):
         raise HTTPException(
-            status_code=404,
-            detail=f"Repository '{name}' was not found in "
-            "workspace/repositories.",
+            status_code=400,
+            detail=(
+                "Provide exactly one of repository_name "
+                "or repository_url"
+            ),
         )
 
-    return name
+    if request.repository_name:
+
+        name =request.repository_name.strip()
+
+        if not repository_exists(name):
+
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Repository '{name}' was not found "
+                    "inside workspace/repositories."
+                )
+            )
+
+        return {
+            "repository_name" : name,
+            "source" : "local",
+            "repository_url" : None,
+            "branch" : None,
+            "base_branch" : None
+        }
+
+    try :
+
+        repository = clone_repository(
+            repository_url=request.repository_url,
+            base_branch=request.base_branch
+        )
+
+        branch_name = (
+            "agent_squad/"
+            + datetime.now(timezone.utc).strftime(
+                "%Y%m%d-%H%M%S"
+            )
+            + "-"
+            + uuid.uuid4().hex[:6]
+        )
+
+        create_development_branch(
+            repository_name=repository["repository_name"],
+            branch_name=branch_name,
+        )
+
+        return {
+            "repository_name": repository["repository_name"],
+            "source": "github",
+            "repository_url": repository["repository_url"],
+            "branch": branch_name,
+            "base_branch": repository["base_branch"],
+        }
+
+    except GithubIntegrationError as error:
+
+        raise HTTPException(
+            status_code= 400,
+            detail=str(error)
+        )
 
 
-def _busy(name: str) -> HTTPException:
+def _busy(name) :
     return HTTPException(
-        status_code=409,
-        detail=f"Repository '{name}' already has a run in progress.",
+        status_code= 409,
+        detail= (
+            f"Repository '{name}' already has "
+            "a development run in progress."
+        ),
     )
-
 
 @router.post("/run")
 def run_development(request: DevelopmentRequest):
-    """Run the workflow and wait for it to finish (can take minutes)."""
 
-    name = _validated_repository(request)
+    repository = _resolve_repository(request)
 
-    try:
+    name = repository["repository_name"]
+
+    try :
         acquire_repository(name)
+
     except RepositoryBusyError:
         raise _busy(name)
 
-    try:
+    try :
+
         flow = DevelopmentFlow()
 
         flow.kickoff(
-            inputs={
-                "repository_name": name,
-                "user_request": request.user_request.strip(),
+            inputs = {
+                "repository_name" : name,
+                "user_request" : request.user_request.strip()
             }
         )
-    finally:
+
+    finally :
         release_repository(name)
 
-    if flow.state.status == "failed":
+    if flow.state.status == "failed" :
+
         raise HTTPException(
-            status_code=ERROR_STATUS_CODES.get(flow.state.error_code, 500),
+            status_code= ERROR_STATUS_CODE.get(
+                flow.state.error_code,
+                500,
+            ),
             detail={
-                "status": "failed",
-                "error_code": flow.state.error_code,
-                "error": flow.state.error,
-                "report": flow.state.final_report,
-            },
+                "status" : "failed",
+                "error_code" : flow.state.error_code,
+                "error" : flow.state.error,
+                "report" : flow.state.final_report
+            }
         )
 
-    return build_result(flow)
+    result = build_result(flow)
+
+    result["source"] = repository["source"]
+    result["repository_url"] = repository["repository_url"]
+    result["branch"] = repository["branch"]
+    result["base_branch"] = repository["base_branch"]
+
+    return result
 
 
 @router.post("/jobs", status_code=202)
-def start_job(request: DevelopmentRequest, background_tasks: BackgroundTasks):
-    """Start the workflow in the background and return a job id at once."""
+def start_job(
+    request: DevelopmentRequest,
+    background_task: BackgroundTasks,
+):
+    """Start the complete workflow in background."""
 
-    name = _validated_repository(request)
+    if bool(request.repository_name) == bool(request.repository_url):
 
-    try:
-        job = create_job(name, request.user_request.strip())
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Provide exactly one of repository_name "
+                "or repository_url."
+            ),
+        )
+    
+    try :
+
+        if request.repository_name:
+
+            name = request.repository_name.strip()
+
+            if not repository_exists(name):
+
+                raise HTTPException(
+                    status_code= 404,
+                    detail=f"Repository '{name}' was not found."
+                )
+            source = "local"
+            repository_url = None
+            base_branch = None
+
+
+        else :
+
+            owner, repository = validate_github_url(
+                request.repository_url
+            )
+
+            name = repository_directory_name(
+                owner,
+                repository
+            )
+
+            source = "github"
+            repository_url = request.repository_url.strip()
+
+            base_branch = (
+                request.base_branch.strip()
+                if request.base_branch
+                else None
+            )
+
+        job = create_job(
+            repository_name= name,
+            user_request= request.user_request.strip(),
+            source = source,
+            repository_url= repository_url,
+            base_branch= base_branch,
+        )
+
     except RepositoryBusyError:
+
         raise _busy(name)
 
-    background_tasks.add_task(execute_job, job)
+    except GithubIntegrationError as error:
+
+        raise HTTPException(
+            status_code= 400,
+            detail= str(error)
+        )
+
+    background_task.add_task(
+        execute_job,
+        job
+    )
 
     return {
         "job_id": job.id,
-        "status": "queued",
+        "status": job.status,
+        "stage": job.stage,
+        "repository": job.repository_name,
+        "source": job.source,
+        "repository_url": job.repository_url,
+        "base_branch": job.base_branch,
+        "development_branch": job.development_branch,
         "status_url": f"/api/jobs/{job.id}",
     }
 
-
 @router.get("/jobs")
 def list_jobs(limit: int = 20):
-    """Most recent jobs, newest first (summary only, without reports)."""
 
     summaries = []
 
-    for job in job_store.recent(max(1, min(limit, 100))):
+    for job in job_store.recent(
+        max(1,min(limit, 100))
+    ):
+
         data = job.snapshot()
         data.pop("result", None)
+
         summaries.append(data)
 
     return summaries
@@ -128,11 +300,13 @@ def list_jobs(limit: int = 20):
 
 @router.get("/jobs/{job_id}")
 def get_job(job_id: str):
-    """Live stage while running; full result once finished."""
 
     job = job_store.get(job_id)
 
     if job is None:
-        raise HTTPException(status_code=404, detail="Job not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found."
+        )
 
     return job.snapshot()

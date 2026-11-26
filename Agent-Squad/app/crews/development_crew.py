@@ -151,19 +151,21 @@ class DevelopmentCrew:
 
         correction_task = Task(
             description=(
-                "The previous test execution failed in repository "
-                "'{repository_name}'.\n\n"
-                "Original request: {user_request}\n\n"
-                "Previous test output:\n"
-                "{test_feedback}\n\n"
-                "Inspect the failing tests and relevant source files. "
-                "Identify the root cause and make the smallest necessary "
-                "correction using your repository tools. Preserve unrelated "
-                "code. Do not modify tests merely to hide a real defect. "
-                "Report exactly what you changed."
+                "Perform the FINAL CODE REVIEW after the latest correction "
+                "in repository '{repository_name}'. \n\n"
+                "Inspect the current implementation and Git diff, not just "
+                "the correction summary. Varify that the original request "
+                "is implemnted correctly and that the latest changes do "
+                "not introduce correctness, security or regression issue.\n\n"
+                "If no BLOCKER or MAJOR issue remain, explicit state "
+                "APPROVED.\n\n"
+                "If any BLOCKER or MAJOR issue remains, explicitly state "
+                "CHANGES REQUIRED and explain the findings.\n\n"
+                "Do not modify files."
             ),
             expected_output=(
-                "Root cause, correction details, and files changed."
+                "Final review verdict: APPROVED or CHANGES REQUIRED, "
+                "with supporting findings"
             ),
             agent=coder,
         )
